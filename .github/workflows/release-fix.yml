@@ -1,0 +1,128 @@
+name: Release Fix (linux/amd64)
+
+on:
+  push:
+    tags:
+      - "v*-fix.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build linux/amd64 release package
+        run: |
+          set -euo pipefail
+
+          PROJECT="terraform-provider-opentelekomcloud"
+          MODULE="github.com/opentelekomcloud/terraform-provider-opentelekomcloud"
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          BASE_TAG="${TAG%%-fix.*}"
+
+          BIN_NAME="${PROJECT}_v${VERSION}"
+          ZIP_NAME="${PROJECT}_${VERSION}_linux_amd64.zip"
+          CHECKSUM_FILE="${PROJECT}_${VERSION}_SHA256SUMS"
+
+          rm -rf dist
+          mkdir -p dist
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -trimpath \
+            -ldflags "-s -w -X=${MODULE}/version.ProviderVersion=${VERSION}" \
+            -o "dist/${BIN_NAME}" .
+
+          chmod 0755 "dist/${BIN_NAME}"
+          touch -d "@$(git log -1 --format=%ct)" "dist/${BIN_NAME}"
+
+          zip -j "dist/${ZIP_NAME}" "dist/${BIN_NAME}"
+          (
+            cd dist
+            sha256sum "${ZIP_NAME}" > "${CHECKSUM_FILE}"
+          )
+
+          ls -lh dist/
+          cat "dist/${CHECKSUM_FILE}"
+
+          {
+            echo "PROJECT=${PROJECT}"
+            echo "TAG=${TAG}"
+            echo "VERSION=${VERSION}"
+            echo "BASE_TAG=${BASE_TAG}"
+            echo "ZIP_NAME=${ZIP_NAME}"
+            echo "CHECKSUM_FILE=${CHECKSUM_FILE}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_URL="https://github.com/opentelekomcloud/terraform-provider-opentelekomcloud.git"
+          CHANGES=""
+          if git fetch --no-tags "${UPSTREAM_URL}" "refs/tags/${BASE_TAG}:refs/tags/${BASE_TAG}" 2>/dev/null; then
+            CHANGES="$(git log --no-merges --pretty=format:'* %h %s' "${BASE_TAG}..HEAD" -- ':!.github/workflows/release-fix.yml' || true)"
+          fi
+
+          cat > dist/RELEASE_NOTES.md <<EOF
+          Custom fix release based on official tag [\`${BASE_TAG}\`](https://github.com/opentelekomcloud/terraform-provider-opentelekomcloud/releases/tag/${BASE_TAG}) (\`linux/amd64\` only).
+
+          ## Included Changes
+          ${CHANGES:-"* $(git log -1 --pretty=format:'%h %s')"}
+
+          ## Assets
+          * \`${ZIP_NAME}\`
+          * \`${CHECKSUM_FILE}\`
+
+          ## Usage with Terraform / OpenTofu (\`filesystem_mirror\`)
+          \`\`\`bash
+          MIRROR_DIR="\$HOME/.terraform.d/mirror/registry.terraform.io/opentelekomcloud/opentelekomcloud"
+          mkdir -p "\$MIRROR_DIR"
+          curl -fSL -o "\$MIRROR_DIR/${ZIP_NAME}" \\
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ZIP_NAME}"
+          \`\`\`
+          Pin the exact version in \`required_providers\`:
+          \`\`\`hcl
+          terraform {
+            required_providers {
+              opentelekomcloud = {
+                source  = "opentelekomcloud/opentelekomcloud"
+                version = "= ${VERSION}"
+              }
+            }
+          }
+          \`\`\`
+          EOF
+
+          cat dist/RELEASE_NOTES.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PRERELEASE_FLAG=()
+          if [[ "${VERSION}" == *-* ]]; then
+            PRERELEASE_FLAG=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            "dist/${ZIP_NAME}" \
+            "dist/${CHECKSUM_FILE}" \
+            --title "${TAG}" \
+            --notes-file dist/RELEASE_NOTES.md \
+            "${PRERELEASE_FLAG[@]}"
